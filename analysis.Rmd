@@ -1,0 +1,1231 @@
+---
+title: "Predicting Equipment Failures: Random Forest vs XGBoost"
+author: "Bhuwan Aneja"
+date: "2026-09-22"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ranger)
+library(xgboost)
+
+set.seed(123)
+
+theme_set(theme_minimal())
+
+```
+
+# Task A
+
+## Q1
+
+```{r}
+weekly <- read_csv("asset_weekly.csv", show_col_types = FALSE)
+registry <- read_csv("asset_registry.csv", show_col_types = FALSE)
+
+dim(weekly)
+dim(registry)
+
+sapply(weekly, class)
+sapply(registry, class)
+```
+
+The weekly dataset initially contained 4,722 rows and 14 variables, while the asset registry contained 260 rows and 7 variables. Most numerical measurements were imported as numeric variables and the categorical variables were imported as character variables. week_start was initially imported as a character variable rather than a date, so it required cleaning.
+
+## Q2
+
+
+```{r}
+# Duplicate rows
+sum(duplicated(weekly))
+sum(duplicated(registry))
+
+# Leading/trailing spaces in asset_id
+sum(weekly$asset_id != trimws(weekly$asset_id))
+sum(registry$asset_id != trimws(registry$asset_id))
+
+# Category labels
+unique(weekly$operating_mode)
+unique(registry$region)
+unique(registry$vendor)
+unique(registry$asset_type)
+unique(registry$criticality)
+
+# Missing values
+sapply(weekly, function(x) sum(is.na(x)))
+sapply(registry, function(x) sum(is.na(x)))
+
+# Numerical ranges
+summary(
+  weekly %>%
+    select(
+      load_pct,
+      bearing_temp_c,
+      vibration_mm_s,
+      pressure_kpa,
+      runtime_hours,
+      days_since_maintenance,
+      alarm_count,
+      ambient_temp_c,
+      inspection_score
+    )
+)
+
+# Date-format check
+table(grepl("^\\d{4}-\\d{2}-\\d{2}$", weekly$week_start))
+```
+Several problems were found through the data-quality checks. In asset_weekly, there were duplicate rows in that table (42), and asset_registry had no duplicates. No leading or trailing spaces were found in `asset_id`.
+
+There were multiple categorical variables with inconsistent labels. For instance, among the available options for operatin_mode, the possible values were "Auto", "AUTO", and "automatic", and similar inconsistencies were seen for the region, vendor and criticality.
+
+There were some missing values for some of the numerical variables such as `bearing_temp_c`, `vibration_mm_s`, `pressure_kpa`, `days_since_maintenance`, and `inspection_score`, which were all measured on a weekly basis. There were no missing values in the registry.
+
+The numerical values of some of these were clearly unrealistic: The value of `load_pct` contained negative values, and the value of `runtime_hours` contained negative values and values greater than 168 hours, which is not possible for a week. same goes for `vibration_mm_s`
+
+Another date check found the date formats were inconsistent: 4,698 records formatted as YYYY-MM-DD, and 24 records formatted as some other date pattern (e.g. DD/MM/YYYY).
+
+## Q3
+
+```{r}
+# Remove duplicate rows
+weekly <- weekly %>%
+  distinct()
+
+# Standard category labels
+weekly <- weekly %>%
+  mutate(
+    operating_mode = case_when(
+      operating_mode %in% c("Auto", "AUTO", "automatic") ~ "Auto",
+      operating_mode %in% c("Manual", "MANUAL", "manual") ~ "Manual",
+      operating_mode %in% c("Standby", "Stand By", "stand-by") ~ "Standby",
+      TRUE ~ operating_mode
+    )
+  )
+
+registry <- registry %>%
+  mutate(
+    region = case_when(
+      region %in% c("North", "north") ~ "North",
+      region %in% c("South", "SOUTH") ~ "South",
+      region %in% c("Coastal", "coast") ~ "Coastal",
+      TRUE ~ region
+    ),
+    
+    vendor = case_when(
+      vendor %in% c("Crown", "crown") ~ "Crown",
+      vendor %in% c("Arden", "ARDEN") ~ "Arden",
+      TRUE ~ vendor
+    ),
+    
+    criticality = case_when(
+      criticality %in% c("High", "HIGH") ~ "High",
+      criticality %in% c("Medium", "med") ~ "Medium",
+      criticality %in% c("Low", "low") ~ "Low",
+      TRUE ~ criticality
+    )
+  )
+
+#dates to one consistent format
+weekly <- weekly %>%
+  mutate(
+    week_start = coalesce(
+      as.Date(week_start, format = "%Y-%m-%d"),
+      as.Date(week_start, format = "%d/%m/%Y")
+    )
+  )
+
+# Treat clearly implausible numerical values as missing
+weekly <- weekly %>%
+  mutate(
+    load_pct = ifelse(load_pct < 0, NA, load_pct),
+    vibration_mm_s = ifelse(vibration_mm_s < 0, NA, vibration_mm_s),
+    runtime_hours = ifelse(
+      runtime_hours < 0 | runtime_hours > 168,
+      NA,
+      runtime_hours
+    )
+  )
+
+dim(weekly)
+sapply(weekly, function(x) sum(is.na(x)))
+```
+Eliminated 42 duplicated weekly time-stamps and consolidated inconsistent categorical labels to a single label for each category.
+
+The two date formats were converted into a common R `Date` format.
+
+For the numerical cleaning, I considered negative load percentage data as missing, as it is impossible, negative vibration measurement data as missing, and `runtime_hours` data below 0 or above 168 hours per week as missing. A few measurements that were very large positive values were not excluded due to lack of sufficient data.
+
+The rows with missing values were not removed. The missing values for the numeric data were left blank in order to be imputed later on based on numeric values derived from the training data only.
+
+The final number of rows after discarding duplicated data, was 4680 for the weekly data set.
+
+
+## Q4
+
+```{r}
+rows_before <- nrow(weekly)
+
+data <- weekly %>%
+  left_join(registry, by = "asset_id")
+
+rows_after <- nrow(data)
+
+rows_before
+rows_after
+
+sum(is.na(data$region))
+```
+
+The table has 4680 rows in the weekly data set before the join, and 4680 rows after the join.
+
+Also, there were no missing `region` values as a result of the join, which is an indication that all records in the weekly dataset were matched with an asset in the registry.
+
+So, it was not surprising that the join didn't drop or add any observations per week.
+
+
+## Q5
+
+```{r}
+data <- data %>%
+  mutate(
+    asset_age_years = 2026 - commission_year,
+    
+    load_group = case_when(
+      load_pct < 60 ~ "Low",
+      load_pct < 80 ~ "Medium",
+      load_pct >= 80 ~ "High",
+      TRUE ~ NA_character_
+    )
+  )
+
+summary(data$asset_age_years)
+
+table(data$load_group, useNA = "ifany")
+```
+
+Created asset_age_years as the difference between 2026 and the asset's commission_year. This provides a basic indication of the duration of operation of each asset and can provide some indication of the effects of ageing.
+
+I created load_group from load_pct using:
+
+- **Low:** below 60%
+- **Medium:** 60% to below 80%
+- **High:** 80% or above
+
+The grouping was made to facilitate the study of changes in the probability of incidence at different levels of operating load and possibly in non-linear patterns.
+
+
+# Task B
+
+## Q1
+
+```{r}
+incident_rate <- mean(data$incident_next_7d)
+
+table(data$incident_next_7d)
+
+prop.table(table(data$incident_next_7d))
+
+incident_rate
+```
+
+The overall incident rate was approximately 13.55%. There were 634 incident observations and 4,046 non-incident observations.This means that about 86.45% of the observations had no incident in the following seven days.
+
+Classification accuracy alone would therefore not be a suitable performance measure. A model that simply predicts `"no incident"` for every observation would achieve approximately 86.45% accuracy, even though it would fail to identify any actual incidents.
+
+For this reason, additional measures such as ROC AUC, log loss, sensitivity and specificity are more informative for evaluating the models.
+
+## Q2
+### PLOT 1
+```{r, warning=FALSE}
+ggplot(
+  data,
+  aes(
+    x = factor(incident_next_7d),
+    y = bearing_temp_c
+  )
+) +
+  geom_boxplot() +
+  labs(
+    x = "Incident in next 7 days",
+    y = "Bearing temperature (°C)",
+    title = "Bearing temperature by incident outcome"
+  ) +
+  theme_minimal()
+
+data %>%
+  group_by(incident_next_7d) %>%
+  summarise(
+    mean_temp = mean(bearing_temp_c, na.rm = TRUE),
+    median_temp = median(bearing_temp_c, na.rm = TRUE)
+  )
+```
+The incident group showed a higher mean bearing temperature when compared to the non-incident group: 64.7°C versus 63.8°C. Even though the two boxplots had a large overlap, the finding suggests that bearing temperature alone shows only a weak association with whether an incident happened. Nevertheless, it might still be helpful as one of the predictors.
+
+
+### PLOT 2
+
+```{r}
+load_summary <- data %>%
+  filter(!is.na(load_group)) %>%
+  group_by(load_group) %>%
+  summarise(
+    incident_rate = mean(incident_next_7d),
+    n = n()
+  )
+
+load_summary
+
+ggplot(
+  load_summary,
+  aes(
+    x = load_group,
+    y = incident_rate
+  )
+) +
+  geom_col() +
+  labs(
+    x = "Load group",
+    y = "Incident rate",
+    title = "Incident rate by operating load group"
+  ) +
+  theme_minimal()
+```
+
+The incident rate was about 12.0% in the case of Low load group, 12.2% in the case of Medium load group, and 18.7% in case of High load group.
+
+While the Low and Medium groups had almost identical incident rates, the High load group had a considerably higher rate. This indicates that the relationship between load put into operation and incident risk may not be simple enough and that risk gets intensified more significantly above a certain range of levels of load.
+
+### PLOT 3
+
+```{r}
+data <- data %>%
+  mutate(
+    vibration_group = case_when(
+      vibration_mm_s < 2.5 ~ "Low",
+      vibration_mm_s < 4 ~ "Medium",
+      vibration_mm_s >= 4 ~ "High",
+      TRUE ~ NA_character_
+    )
+  )
+
+interaction_summary <- data %>%
+  filter(
+    !is.na(load_group),
+    !is.na(vibration_group)
+  ) %>%
+  group_by(load_group, vibration_group) %>%
+  summarise(
+    incident_rate = mean(incident_next_7d),
+    n = n(),
+    .groups = "drop"
+  )
+
+interaction_summary
+
+ggplot(
+  interaction_summary,
+  aes(
+    x = load_group,
+    y = incident_rate,
+    fill = vibration_group
+  )
+) +
+  geom_col(position = "dodge") +
+  labs(
+    x = "Load group",
+    y = "Incident rate",
+    fill = "Vibration group",
+    title = "Incident rate by load and vibration group"
+  ) +
+  theme_minimal()
+
+```
+
+While vibration levels were relatively elevated in all load groups, the highest incident rate was recorded when both load and vibration were high. Incidents are estimated to have occurred at around 27.7% of the time.
+For example, within the Low load group, incidents of low vibration were observed at about 7.5%, while the maximum incident rate of high vibration was about 22.8%. A similar trend was also noted in the Medium load group, along with the High load group. 
+
+This implies that there might be some interaction between load and vibration since the influence of one variable might change based on the level of the other variable.
+
+## Q3
+
+Two trends observed in the exploratory analysis may be better explained by tree-based modelling.
+
+First, the relationship between operating load and incident risk is non-linear. The incident rate for the Low and Medium load groups is quite similar (approximately 12%), but the High load group has a noticeably higher rate of around 18.7%. A tree model will account for this kind of effect with a split at a certain level of load, while a simple additive linear model will take gradual linear dependence into account unless additional terms are introduced.
+
+Second, it seems that there is a possible interaction between load and vibration. The highest rate of incidents takes place when both load and vibration are high (27.7%), while the effect of vibration varies in different load groups. This effect can be captured by a tree model easily, while a simple additive linear model would require additional interaction terms.
+
+# Task C
+
+## Q1
+
+
+```{r}
+set.seed(123)
+
+asset_ids <- unique(data$asset_id)
+
+train_ids <- sample(
+  asset_ids,
+  size = floor(0.75 * length(asset_ids))
+)
+
+train <- data %>%
+  filter(asset_id %in% train_ids)
+
+test <- data %>%
+  filter(!asset_id %in% train_ids)
+
+length(unique(train$asset_id))
+length(unique(test$asset_id))
+
+nrow(train)
+nrow(test)
+
+intersect(
+  unique(train$asset_id),
+  unique(test$asset_id)
+)
+```
+The data were split at the asset level so that all weekly observations from the same asset remained in the same dataset.
+There were 195 assets in the training set and 65 assets in the test set, corresponding to the required 75%/25% split.
+The training set contained 3,510 weekly observations, while the test set contained 1,170 weekly observations.
+The intersection between the training and test asset IDs was empty, confirming that no asset appeared in both datasets.
+
+## Q2
+
+```{r}
+# Identify numeric variables with missing values in the training set
+num_missing <- names(train)[
+  sapply(
+    train,
+    function(x) is.numeric(x) && any(is.na(x))
+  )
+]
+
+num_missing
+
+# Calculating trainingset medians
+impute_values <- sapply(
+  train[num_missing],
+  median,
+  na.rm = TRUE
+)
+
+impute_values
+
+# Apply the same training medians to both training and test data
+for (v in num_missing) {
+  train[[v]][is.na(train[[v]])] <- impute_values[v]
+  test[[v]][is.na(test[[v]])] <- impute_values[v]
+}
+
+# Checking that missing numerical values have been filled
+sapply(train[num_missing], function(x) sum(is.na(x)))
+sapply(test[num_missing], function(x) sum(is.na(x)))
+
+```
+
+The variables requiring numerical imputation were `load_pct`, `bearing_temp_c`, `vibration_mm_s`, `pressure_kpa`, `runtime_hours`, `days_since_maintenance`, and `inspection_score`.
+I used the median calculated from the training data for each variable and applied the same median to both the training and test sets.
+Using the training data only is preferable because calculating imputation values from the complete dataset would allow information from the test set to influence the model-building process. This would cause data leakage and could make the final test performance appear more optimistic than it really is.
+
+## Q3
+
+```{r}
+log_loss <- function(actual, prob) {
+  
+  prob <- pmin(
+    pmax(prob, 1e-15),
+    1 - 1e-15
+  )
+  
+  -mean(
+    actual * log(prob) +
+      (1 - actual) * log(1 - prob)
+  )
+}
+
+
+roc_auc <- function(actual, prob) {
+  
+  n_pos <- sum(actual == 1)
+  n_neg <- sum(actual == 0)
+  
+  ranks <- rank(
+    prob,
+    ties.method = "average"
+  )
+  
+  rank_pos <- sum(ranks[actual == 1])
+  
+  auc <- (
+    rank_pos - n_pos * (n_pos + 1) / 2
+  ) / (n_pos * n_neg)
+  
+  auc
+}
+
+
+class_metrics <- function(actual, prob, threshold = 0.5) {
+  
+  pred <- ifelse(
+    prob >= threshold,
+    1,
+    0
+  )
+  
+  TP <- sum(pred == 1 & actual == 1)
+  TN <- sum(pred == 0 & actual == 0)
+  FP <- sum(pred == 1 & actual == 0)
+  FN <- sum(pred == 0 & actual == 1)
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  c(
+    sensitivity = sensitivity,
+    specificity = specificity
+  )
+}
+```
+
+`Log_loss` is a metric that assesses the quality of probabilities produced by the predictions made and penalises overly confident false predictions. 
+
+`ROC AUC` is a metric that assesses how well the model ranks the incidences correctly over the incidents.
+
+At a threshold of 0.5, the sensitivity is the percentage of correctly identified incidence and the specificity is the percentage of correctly identified non-incidents.
+
+All these metrics will be useful in checking the performance of the final Random Forest and the XGBoost models.
+
+
+# Task D
+
+## D-1
+
+Before fitting the random forest, the grouped variables were recreated after numerical imputation so that the imputed values were also assigned to a category.
+
+```{r}
+train <- train %>%
+  mutate(
+    load_group = case_when(
+      load_pct < 60 ~ "Low",
+      load_pct < 80 ~ "Medium",
+      load_pct >= 80 ~ "High"
+    ),
+    vibration_group = case_when(
+      vibration_mm_s < 2.5 ~ "Low",
+      vibration_mm_s < 4 ~ "Medium",
+      vibration_mm_s >= 4 ~ "High"
+    )
+  )
+
+test <- test %>%
+  mutate(
+    load_group = case_when(
+      load_pct < 60 ~ "Low",
+      load_pct < 80 ~ "Medium",
+      load_pct >= 80 ~ "High"
+    ),
+    vibration_group = case_when(
+      vibration_mm_s < 2.5 ~ "Low",
+      vibration_mm_s < 4 ~ "Medium",
+      vibration_mm_s >= 4 ~ "High"
+    )
+  )
+```
+
+The identifier `asset_id` and raw date `week_start` were excluded from the predictor set.
+
+```{r}
+rf_train <- train %>%
+  select(-asset_id, -week_start)
+
+rf_test <- test %>%
+  select(-asset_id, -week_start)
+
+rf_train$incident_next_7d <- factor(rf_train$incident_next_7d)
+rf_test$incident_next_7d <- factor(rf_test$incident_next_7d)
+
+set.seed(123)
+
+rf_base <- ranger(
+  incident_next_7d ~ .,
+  data = rf_train,
+  num.trees = 500,
+  probability = TRUE
+)
+```
+
+### Training misclassification rate
+
+```{r}
+train_prob <- predict(
+  rf_base,
+  data = rf_train
+)$predictions[, "1"]
+
+train_pred <- ifelse(train_prob >= 0.5, 1, 0)
+
+train_actual <- as.numeric(
+  as.character(rf_train$incident_next_7d)
+)
+
+train_error <- mean(train_pred != train_actual)
+
+train_error
+```
+
+### OOB misclassification rate
+
+```{r}
+oob_prob <- rf_base$predictions[, "1"]
+
+oob_pred <- ifelse(oob_prob >= 0.5, 1, 0)
+
+oob_error <- mean(oob_pred != train_actual)
+
+oob_error
+```
+
+### Test performance
+
+```{r}
+test_prob_rf <- predict(
+  rf_base,
+  data = rf_test
+)$predictions[, "1"]
+
+test_actual_rf <- as.numeric(
+  as.character(rf_test$incident_next_7d)
+)
+
+log_loss(test_actual_rf, test_prob_rf)
+
+roc_auc(test_actual_rf, test_prob_rf)
+```
+
+The baseline random forest achieved a training error rate equal to 4.96% along with an out of bag (OOB) error rate equal to 13.02%.
+The log loss obtained from the final test data is equal to 0.4127 while the ROC AUC equals 0.6479.
+The training error indicates the performance on data which has been used to train the random forest thus tends to provide an optimistic error estimate while the OOB prediction for the particular observation is obtained from the trees which could not be trained on that observation. Hence OOB error provides a much more reliable estimate of the prediction performance parameter.
+
+
+## D-2
+
+```{r}
+tree_values <- c(50, 100, 250, 500, 1000)
+
+set.seed(123)
+
+oob_errors <- sapply(
+  tree_values,
+  function(ntree) {
+    
+    fit <- ranger(
+      incident_next_7d ~ .,
+      data = rf_train,
+      num.trees = ntree,
+      probability = TRUE
+    )
+    
+    prob <- fit$predictions[, "1"]
+    pred <- ifelse(prob >= 0.5, 1, 0)
+    
+    actual <- as.numeric(
+      as.character(rf_train$incident_next_7d)
+    )
+    
+    mean(pred != actual)
+  }
+)
+
+tree_results <- data.frame(
+  num_trees = tree_values,
+  oob_error = oob_errors
+)
+
+tree_results
+
+ggplot(
+  tree_results,
+  aes(
+    x = num_trees,
+    y = oob_error
+  )
+) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Number of trees",
+    y = "OOB misclassification rate",
+    title = "OOB error against number of trees"
+  ) +
+  theme_minimal()
+```
+
+There was not much difference in the OOB misclassification rate with the number of trees. It was approximately 13.11% with 50 trees, 12.93% with 100 trees, and remained around 12.9% for 250, 500 and 1,000 trees.
+
+The addition of more trees does not lead to serious overfitting, contrary to the statement. For this analysis, the number of trees did not substantially increase the OOB error, but rather it was mostly stabilised.
+
+This is because the random forest trees are fitted randomly, using bootstrap samples and random subsets of predictors with each tree, and the predictions are averaged. The more trees that are added, the more stable this average is, and not the less stable.
+
+
+## D-3
+
+```{r}
+tuning_grid <- expand.grid(
+  mtry = c(2, 4, 8),
+  min_node_size = c(5, 10, 20)
+)
+
+set.seed(123)
+
+tuning_grid$oob_error <- apply(
+  tuning_grid,
+  1,
+  function(x) {
+    
+    fit <- ranger(
+      incident_next_7d ~ .,
+      data = rf_train,
+      num.trees = 500,
+      mtry = x["mtry"],
+      min.node.size = x["min_node_size"],
+      probability = TRUE
+    )
+    
+    prob <- fit$predictions[, "1"]
+    pred <- ifelse(prob >= 0.5, 1, 0)
+    
+    actual <- as.numeric(
+      as.character(rf_train$incident_next_7d)
+    )
+    
+    mean(pred != actual)
+  }
+)
+
+tuning_grid
+
+ggplot(
+  tuning_grid,
+  aes(
+    x = factor(mtry),
+    y = factor(min_node_size),
+    fill = oob_error
+  )
+) +
+  geom_tile() +
+  geom_text(
+    aes(label = round(oob_error, 4))
+  ) +
+  labs(
+    x = "mtry",
+    y = "Minimum node size",
+    fill = "OOB error",
+    title = "Random forest tuning results"
+  ) +
+  theme_minimal()
+```
+
+The smallest OOB misclassification rate (around 12.85%) obtained with mtry = 2 and min.node.size = 20. There were differences between many of the settings which were small, but larger values of mtry, particularly mtry = 8 tended to have slightly higher OOB error.
+
+A smaller mtry value will result in fewer predictors being considered at each split. This results in greater diversity among trees and can help to decrease the correlation between the trees and therefore the variance of the forest as a whole. If mtry is too small, however, individual trees will be weaker.
+
+Larger min.node.size will keep trees from becoming too deep and have very small terminal nodes. This is a regularization technique and can help decrease overfitting. In the analysis, min.node.size = 20 was slightly better than the smaller node sizes.
+
+The random forest specification chosen on the basis of the OOB results was: 500 trees, mtry = 2, min.node.size = 20.
+
+## D-4
+
+```{r}
+set.seed(123)
+
+rf_final <- ranger(
+  incident_next_7d ~ .,
+  data = rf_train,
+  num.trees = 500,
+  mtry = 2,
+  min.node.size = 20,
+  probability = TRUE
+)
+
+# OOB misclassification
+oob_prob_final <- rf_final$predictions[, "1"]
+
+oob_pred_final <- ifelse(
+  oob_prob_final >= 0.5,
+  1,
+  0
+)
+
+train_actual <- as.numeric(
+  as.character(rf_train$incident_next_7d)
+)
+
+oob_error_final <- mean(
+  oob_pred_final != train_actual
+)
+
+# Test predictions
+test_prob_final <- predict(
+  rf_final,
+  data = rf_test
+)$predictions[, "1"]
+
+test_pred_final <- ifelse(
+  test_prob_final >= 0.5,
+  1,
+  0
+)
+
+test_actual <- as.numeric(
+  as.character(rf_test$incident_next_7d)
+)
+
+test_error_final <- mean(
+  test_pred_final != test_actual
+)
+
+oob_error_final
+test_error_final
+
+log_loss(test_actual, test_prob_final)
+roc_auc(test_actual, test_prob_final)
+class_metrics(test_actual, test_prob_final)
+```
+OOB misclassification rate for the selected random forest was 12.91% and the test misclassification rate was 15.30%. The test log loss was 0.4086 and the test ROC AUC was 0.6544. Sensitivity was 0% and specificity was 100% at the threshold of 0.5.
+
+The second lower OOB error indicates that OOB performance was perhaps slightly optimistic from the completely new assets.
+
+The dataset has repeated measurements of the same assets that occur on a weekly basis, which is 1 reason. Other weeks of observations may be included in the bootstrap samples even if one of those weeks is OOB for that tree. These observations can be alike and have the same asset-specific properties, and thus the model indirectly gets information about the same asset.
+
+The latter test set, however, is entirely different from the first test set since the train/test split was done at the asset level. Thus, the test set is more representative of real world performance on new assets.
+
+
+# Task E
+
+## E-1
+
+First, five fold cross-validation was created at the asset level so that all weekly observations from the same asset remained in the same fold.
+
+```{r}
+set.seed(123)
+
+train_assets <- unique(train$asset_id)
+
+fold_number <- sample(
+  rep(1:5, length.out = length(train_assets))
+)
+
+asset_folds <- data.frame(
+  asset_id = train_assets,
+  fold = fold_number
+)
+
+train_xgb <- train %>%
+  left_join(asset_folds, by = "asset_id")
+
+table(asset_folds$fold)
+table(train_xgb$fold)
+```
+
+There were 195 training assets, with 39 assets in each fold. Each fold contained 702 weekly observations.
+
+The predictors were then converted into a numerical design matrix for XGBoost. Identifiers, the raw date, the response variable and the fold indicator were excluded from the predictor matrix.
+
+```{r}
+x_train <- model.matrix(
+  ~ . - 1,
+  data = train_xgb %>%
+    select(
+      -asset_id,
+      -week_start,
+      -incident_next_7d,
+      -fold
+    )
+)
+
+y_train <- train_xgb$incident_next_7d
+
+dtrain <- xgb.DMatrix(
+  data = x_train,
+  label = y_train
+)
+
+folds <- lapply(
+  1:5,
+  function(i) {
+    which(train_xgb$fold == i)
+  }
+)
+
+dim(x_train)
+sapply(folds, length)
+```
+
+A deliberately flexible XGBoost model was fitted using deep trees, a relatively large learning rate and 500 boosting rounds.
+
+```{r}
+params_flex <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = 0.2,
+  max_depth = 8,
+  min_child_weight = 1,
+  subsample = 1,
+  colsample_bytree = 1
+)
+
+set.seed(123)
+
+cv_flex <- xgb.cv(
+  params = params_flex,
+  data = dtrain,
+  nrounds = 500,
+  folds = folds,
+  verbose = 0
+)
+
+best_round_flex <- which.min(
+  cv_flex$evaluation_log$test_logloss_mean
+)
+
+best_round_flex
+
+cv_flex$evaluation_log[
+  best_round_flex,
+]
+```
+
+The lowest cross-validation log loss occurred at round 6, where the training log loss was approximately 0.2453 and the cross-validation log loss was approximately 0.3673.
+
+To visualise overfitting, training and cross-validation log loss were plotted across boosting rounds.
+
+```{r}
+cv_plot <- cv_flex$evaluation_log %>%
+  select(
+    iter,
+    train_logloss_mean,
+    test_logloss_mean
+  ) %>%
+  pivot_longer(
+    cols = c(
+      train_logloss_mean,
+      test_logloss_mean
+    ),
+    names_to = "dataset",
+    values_to = "logloss"
+  )
+
+ggplot(
+  cv_plot,
+  aes(
+    x = iter,
+    y = logloss,
+    linetype = dataset
+  )
+) +
+  geom_line() +
+  geom_vline(
+    xintercept = best_round_flex,
+    linetype = "dashed"
+  ) +
+  labs(
+    x = "Boosting round",
+    y = "Log loss",
+    linetype = "",
+    title = "Training and cross-validation log loss"
+  ) +
+  theme_minimal()
+```
+
+After about 6 boosting rounds, cross-validation log loss stopped improving and began to increase, while training log loss continued to decrease.
+
+By round 500, training log loss had fallen to approximately 0.0043, while cross-validation log loss had increased to approximately 0.6515.
+
+This is direct evidence of overfitting: the model continued to fit the training data increasingly well, but its performance on held-out assets became worse.
+
+
+## E-2
+
+```{r}
+set.seed(123)
+
+cv_early <- xgb.cv(
+  params = params_flex,
+  data = dtrain,
+  nrounds = 500,
+  folds = folds,
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+best_round_early <- which.min(
+  cv_early$evaluation_log$test_logloss_mean
+)
+
+best_score_early <- min(
+  cv_early$evaluation_log$test_logloss_mean
+)
+
+best_round_early
+best_score_early
+
+nrow(cv_early$evaluation_log)
+```
+
+With the utilization of early stopping, a total of 6 boosting rounds were performed i.e. The CV run stopped at round 26 after 20 further rounds without improvement., and the least cross-validation log loss value was found to approximately be equal to 0.3673.
+
+The cross-validation procedure finished at 26 rounds since the best performance was achieved in round 6, and there were no improvements in the following 20 rounds.
+
+Early stopping is critical in the case of boosting, as any new tree is fitted one after another due to the intention to improve the updated model. If boosting is applied for several rounds, it is possible for the model to start fitting noise present in the training dataset.
+
+This was illustrated in Question E1, where the training log loss continued to go down after round 6, while cross-validation log loss started to grow.
+
+In the case of a random forest, trees are fitted independently, and their predictions are simply averaged together. Generally, using more trees gives more stability to the entire ensemble rather than allowing it to get used to the training data in the course of time. Thus, the number of boosting rounds would have a more direct impact on the model complexity than the number of trees within the random forest.
+
+
+## E-3
+
+A tuning grid was created using five XGBoost hyperparameters: `eta`, `max_depth`, `min_child_weight`, `subsample`, and `colsample_bytree`.
+
+```{r}
+tune_grid <- data.frame(
+  eta = c(0.20, 0.10, 0.05, 0.10, 0.05, 0.10),
+  max_depth = c(8, 4, 3, 3, 4, 5),
+  min_child_weight = c(1, 5, 5, 10, 10, 5),
+  subsample = c(1.0, 0.8, 0.8, 0.8, 0.7, 0.7),
+  colsample_bytree = c(1.0, 0.8, 0.8, 0.8, 0.8, 0.7)
+)
+
+tune_grid
+```
+
+Each parameter combination was evaluated using the same five grouped folds and early stopping.
+
+```{r}
+tune_results <- lapply(
+  1:nrow(tune_grid),
+  function(i) {
+    
+    params <- list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      eta = tune_grid$eta[i],
+      max_depth = tune_grid$max_depth[i],
+      min_child_weight = tune_grid$min_child_weight[i],
+      subsample = tune_grid$subsample[i],
+      colsample_bytree = tune_grid$colsample_bytree[i]
+    )
+    
+    set.seed(123)
+    
+    cv <- xgb.cv(
+      params = params,
+      data = dtrain,
+      nrounds = 500,
+      folds = folds,
+      early_stopping_rounds = 20,
+      verbose = 0
+    )
+    
+    best_round <- which.min(
+      cv$evaluation_log$test_logloss_mean
+    )
+    
+    best_loss <- min(
+      cv$evaluation_log$test_logloss_mean
+    )
+    
+    data.frame(
+      best_round = best_round,
+      cv_logloss = best_loss
+    )
+  }
+)
+
+tune_results <- bind_rows(tune_results)
+
+tune_results <- bind_cols(
+  tune_grid,
+  tune_results
+)
+
+tune_results
+```
+
+The best parameter combination was identified using the lowest cross-validation log loss.
+
+```{r}
+best_model_row <- which.min(
+  tune_results$cv_logloss
+)
+
+tune_results[
+  best_model_row,
+]
+```
+The best tuned model used:
+`eta = 0.05`, `max_depth = 3`, `min_child_weight = 5`, `subsample = 0.8`, `colsample_bytree = 0.8`, 63 boosting rounds
+
+The grouped cross validation log loss was about 0.3579, whereas the intentionally flexible model had a log loss of 0.3673.
+
+The tuned model is more regularised than the flexible model. The smaller value of the learning rate (`eta = 0.05`) makes for less aggressive boosting steps. This lowers the model complexity (with the shallower trees, `max_depth = 3`), and prevents the model from splitting very small numbers of observations (with the larger `min_child_weight = 5`).
+
+The value of `subsample = 0.8` indicates that only 80% of the observations are used in each boosting round and `colsample_bytree = 0.8` indicates that 80% of the predictors are used for each tree. These settings add more noise and minimize overfitting.
+
+In general, the cross validation log loss of the more regularised model was smaller than that of the more flexible model, indicating it performed better on the unseen assets.
+
+
+## E-4
+
+First, the test predictors were converted into a numerical design matrix with the same columns as the training matrix.
+
+```{r}
+x_test <- model.matrix(
+  ~ . - 1,
+  data = test %>%
+    select(
+      -asset_id,
+      -week_start,
+      -incident_next_7d
+    )
+)
+
+y_test <- test$incident_next_7d
+
+missing_cols <- setdiff(
+  colnames(x_train),
+  colnames(x_test)
+)
+
+for (v in missing_cols) {
+  x_test <- cbind(x_test, 0)
+  colnames(x_test)[ncol(x_test)] <- v
+}
+
+extra_cols <- setdiff(
+  colnames(x_test),
+  colnames(x_train)
+)
+
+x_test <- x_test[
+  ,
+  setdiff(colnames(x_test), extra_cols),
+  drop = FALSE
+]
+
+x_test <- x_test[
+  ,
+  colnames(x_train),
+  drop = FALSE
+]
+```
+
+The final XGBoost model was fitted using the parameter values selected by grouped cross-validation.
+
+```{r}
+final_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = 0.05,
+  max_depth = 3,
+  min_child_weight = 5,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(123)
+
+xgb_final <- xgb.train(
+  params = final_params,
+  data = dtrain,
+  nrounds = 63,
+  verbose = 0
+)
+```
+
+Predicted probabilities were then calculated for the final test assets.
+
+```{r}
+test_prob_xgb <- predict(
+  xgb_final,
+  x_test
+)
+
+test_actual_xgb <- as.numeric(y_test)
+
+log_loss(
+  test_actual_xgb,
+  test_prob_xgb
+)
+
+roc_auc(
+  test_actual_xgb,
+  test_prob_xgb
+)
+
+class_metrics(
+  test_actual_xgb,
+  test_prob_xgb
+)
+```
+
+The tuned XGBoost model had a test log loss of 0.4080 and a ROC AUC of 0.6622.
+
+The sensitivity and specificity of the model were 2.23% and 99.60%, respectively, at the classification value of 0.5.
+
+The very high specificity and very low sensitivity is indicative of the fact that the model was mostly correct for non-incidents, but few actual incidents were detected at the 0.5 threshold. This is similar to what is seen in the data set due to the low number of incidents.
+
+
+# Task F
+
+## F-1
+
+The tuned XGBoost model achieved a slightly better result on the final test data compared to the selected Random Forest.
+
+The Random Forest model performance log loss of 0.4086 and its ROC AUC of 0.6544 were comparable to that of XGBoost model with log loss of 0.4080 and ROC AUC of 0.6622 respectively.
+The Random Forest showed 0% sensitivity and 100% specificity at threshold 0.5 which was similar to XGBoost at 2.23% sensitivity and 99.60% specificity.
+
+XGBoost had minimal improvement over the results, but it performed slightly better. Thus it is not likely that these results would be practically important for the improvement. The sensitivity was also very low for both models, with neither of the models successful at the 0.5 threshold.
+
+## F-2
+
+Both Random Forest and XGBoost employ decision trees but with different forms of overfitting.
+
+In a Random Forest, several trees are built from different random samples of data (called bootstraps) and random subsets of predictors, and the predictions from each tree are combined, or averaged. This averaging helps prevent serious overfitting when you add more trees to the model. This is reflected in our results by observing that the OOB error remained between 12.9% and 13.1% as the number of trees increased.
+
+XGBoost sequentially fits trees. New trees are added to correct the errors of the existing ensemble. With too many rounds of boosting, the model will be able to fit noise in the training data increasingly well.
+
+The flexible XGBoost model was evident in this. The optimal cross validation log loss was obtained around round 6, but training log loss still kept on reducing and cross validation log loss kept on increasing. As we can see, the more boosting rounds we added, the more overfitting we did.
+
+
+## F-3
+
+In a Random Forest, the number of independently fitted trees in the ensemble is controlled by `num.trees`. The trees are averaged together, so increasing `num.trees` usually increases the stability of the predictions, and decreases random variation. In our analyzes, increasing the number of trees from 50 to 1000 did not lead to a large increase in OOB error.
+
+In XGBoost the number of trees are controlled by nrounds , which is the number of trees added sequentially. Each new tree is fitted to fix the mistakes in the current model. Thus, increasing `nrounds` directly increases the complexity of the boosted model and may cause overfitting if we boost for too many rounds.
+
+These two parameters shall not be interpreted in the same way. Adding more trees in Random Forest mainly improves stability through averaging. Adding more boosting rounds in XGBoost continues to change the fitted model and eventually leads to a decrease in performance on unseen data.
+
+
+## F-4
+
+Another form of overfitting is to look at the final test set over and over again when you try different model settings.
+
+Repeated use of the test set in model selection will cause information from the test data to leak into the decision of which model to select. The selected model might then perform especially well on that particular test set, but not necessarily on truly new data. This results in an overly optimistic report of test performance.
+
+To reduce this problem hyperparameter tuning and model selection should be done using only the training data, for example with cross-validation or out-of-bag error. Keep the final test set aside and use it only for evaluation after all modeling decisions are made.
+
+# Citations and Acknowledgements
+
+The statistical methods used in this report, including regression trees, random forests, model comparison and variable importance, were based on concepts covered in the STATS 369 lecture notes and course materials.
+
+In addition, I used ChatGPT to help improve the layout and readability of the R code, identify formatting and syntax issues, and organise some of the written explanations. I ran all code myself in RStudio, checked the outputs and graphs, and based the final interpretations on the results produced by my analysis.
+
+
+
+
